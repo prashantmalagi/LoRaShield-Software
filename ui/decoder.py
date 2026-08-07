@@ -75,7 +75,7 @@ class DecoderPage(tk.Frame):
         _btn(ml_inner, '  LOAD AI MODEL  ', self._load_model,
              C['purple']).pack(side='left')
 
-        tk.Label(ml_inner, text='Model path: models/morse_decoder.h5',
+        tk.Label(ml_inner, text='Model path: models/morse_decoder_v2.keras',
                  bg=C['card2'], fg=C['text3'], font=('Segoe UI', 8)).pack(side='right')
 
         # ── Main panels ───────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 """
-LoRaShield – One-shot AI diagnostic script.
+LoRaShield - One-shot AI diagnostic script (v2).
 Run: .venv\Scripts\python.exe diag_ai.py
 """
 import sys, os, traceback, pickle, warnings
@@ -7,28 +7,25 @@ sys.path.insert(0, '.')
 from pathlib import Path
 
 BASE_DIR       = Path(__file__).resolve().parent
-MODEL_PATH     = BASE_DIR / 'models' / 'morse_decoder.h5'
+MODEL_PATH     = BASE_DIR / 'models' / 'morse_decoder_v2.keras'
 TOKENIZER_PATH = BASE_DIR / 'models' / 'tokenizer.pkl'
-ENCODER_PATH   = BASE_DIR / 'models' / 'encoder.pkl'
 
 sep = '-' * 60
 print(sep)
-print('Loading AI Model...')
+print('Loading AI Model (v2 - Seq2Seq Denoising)...')
 print(f'Model path:       {MODEL_PATH}')
 print(f'Tokenizer path:   {TOKENIZER_PATH}')
-print(f'Encoder path:     {ENCODER_PATH}')
 print(f'CWD:              {os.getcwd()}')
 print()
 print(f'Model exists:     {MODEL_PATH.exists()}')
 print(f'Tokenizer exists: {TOKENIZER_PATH.exists()}')
-print(f'Encoder exists:   {ENCODER_PATH.exists()}')
 if MODEL_PATH.exists():
-    print(f'Model file size:  {MODEL_PATH.stat().st_size} bytes')
+    print(f'Model file size:  {MODEL_PATH.stat().st_size:,} bytes')
 print(sep)
 
-# ── TensorFlow ────────────────────────────────────────────────────────────────
+# TensorFlow
 print('\nImporting TensorFlow...')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'   # show ALL TF logs during diagnostic
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 try:
     import tensorflow as tf
@@ -39,7 +36,7 @@ except Exception:
     traceback.print_exc()
     sys.exit(1)
 
-# ── Tokenizer ─────────────────────────────────────────────────────────────────
+# Tokenizer
 print('\nLoading tokenizer...')
 try:
     with open(TOKENIZER_PATH, 'rb') as fh:
@@ -52,65 +49,65 @@ except Exception:
     traceback.print_exc()
     sys.exit(1)
 
-# ── Encoder ───────────────────────────────────────────────────────────────────
-print('\nLoading encoder...')
+# Keras model (.keras format)
+print('\nLoading Keras model (.keras)...')
 try:
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        with open(ENCODER_PATH, 'rb') as fh:
-            enc = pickle.load(fh)
-    print(f'Encoder Type:      {type(enc).__name__}')
-    print(f'Encoder Classes:   {list(enc.classes_)}')
-    print(f'Number of Classes: {len(enc.classes_)}')
+        model = tf.keras.models.load_model(str(MODEL_PATH), compile=False)
+    print(f'Model Input Shape:  {model.input_shape}')
+    print(f'Model Output Shape: {model.output_shape}')
+    print(f'Model Type:         Seq2Seq Denoising (BiLSTM)')
+    print('\nSUCCESS: Model loaded correctly.')
 except Exception:
-    print('FAILED to load encoder:')
+    print('\nFAILED to load model - full traceback:')
     traceback.print_exc()
     sys.exit(1)
 
-# ── Keras model ───────────────────────────────────────────────────────────────
-print('\nLoading Keras model (.h5)...')
-try:
-    model = tf.keras.models.load_model(str(MODEL_PATH))
-    print(f'Model Input Shape:  {model.input_shape}')
-    print(f'Model Output Shape: {model.output_shape}')
-    print('\nSUCCESS: Model loaded correctly.')
-except Exception:
-    print('\nFAILED to load model – full traceback:')
-    traceback.print_exc()
+# Quick inference test
+print('\nRunning quick inference test...')
+import numpy as np
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-    # Try loading as .keras format fallback
-    print('\nAttempting native .keras format load...')
-    try:
-        model2 = tf.keras.models.load_model(str(MODEL_PATH), compile=False)
-        print(f'Native load succeeded!  Input={model2.input_shape}  Output={model2.output_shape}')
-    except Exception:
-        print('Native format also failed:')
-        traceback.print_exc()
+IDX_TO_MORSE = {0: '', 1: '.', 2: '-', 3: ' '}
 
-    # Inspect what the file actually is
-    print('\nInspecting file header (first 20 bytes):')
-    with open(MODEL_PATH, 'rb') as fh:
-        header = fh.read(20)
-    print('  Hex:', header.hex())
-    print('  Raw:', header)
+MORSE_REVERSE = {
+    '.-': 'A', '-...': 'B', '-.-.': 'C', '-..': 'D', '.': 'E',
+    '..-.': 'F', '--.': 'G', '....': 'H', '..': 'I', '.---': 'J',
+    '-.-': 'K', '.-..': 'L', '--': 'M', '-.': 'N', '---': 'O',
+    '.--.': 'P', '--.-': 'Q', '.-.': 'R', '...': 'S', '-': 'T',
+    '..-': 'U', '...-': 'V', '.--': 'W', '-..-': 'X', '-.--': 'Y',
+    '--..': 'Z',
+    '-----': '0', '.----': '1', '..---': '2', '...--': '3', '....-': '4',
+    '.....': '5', '-....': '6', '--...': '7', '---..': '8', '----.': '9',
+}
 
-    # Check if it is actually a zip/SavedModel
-    import zipfile
-    if zipfile.is_zipfile(MODEL_PATH):
-        print('  -> File IS a zip archive (keras SavedModel format?)')
-        with zipfile.ZipFile(MODEL_PATH) as z:
-            print('  Contents:', z.namelist()[:10])
-    else:
-        print('  -> File is NOT a zip archive (legacy HDF5 expected)')
+def decode_pipeline(noisy_morse):
+    seqs = tok.texts_to_sequences([noisy_morse])
+    padded = pad_sequences(seqs, maxlen=108, padding='post', truncating='post')
+    pred = model.predict(padded, verbose=0)
+    pred_idx = np.argmax(pred[0], axis=-1)
+    active = min(len(seqs[0]), 108)
+    corrected = ''.join(IDX_TO_MORSE.get(int(i), '') for i in pred_idx[:active]).strip()
+    # Decode corrected morse
+    words = corrected.split(' / ') if ' / ' in corrected else [corrected]
+    decoded = ' '.join(
+        ''.join(MORSE_REVERSE.get(c.strip(), '?') for c in w.strip().split(' ') if c.strip())
+        for w in words if w.strip()
+    )
+    conf = float(np.mean(np.max(pred[0][:active], axis=-1)))
+    return corrected, decoded, conf
 
-    # Try h5py directly
-    print('\nTrying h5py direct open...')
-    try:
-        import h5py
-        with h5py.File(MODEL_PATH, 'r') as hf:
-            print(f'  h5py opened OK.  Keys: {list(hf.keys())}')
-    except ImportError:
-        print('  h5py not installed – install with: pip install h5py')
-    except Exception:
-        print('  h5py open failed:')
-        traceback.print_exc()
+test_cases = [
+    '... --- ...',
+    '.- -... -.-.',
+]
+for tc in test_cases:
+    corrected, decoded, conf = decode_pipeline(tc)
+    print(f'  Input:     {repr(tc)}')
+    print(f'  Corrected: {repr(corrected)}')
+    print(f'  Decoded:   {repr(decoded)}')
+    print(f'  Conf:      {conf:.3f}')
+    print()
+
+print('Diagnostic complete.')

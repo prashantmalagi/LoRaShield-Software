@@ -1,38 +1,32 @@
 """
-LoRaShield – AI Utility Module (Production)
-============================================
-Real TensorFlow/Keras integration for Morse-to-Text AI decoding.
+LoRaShield - AI Utility Module (v2)
+=====================================
+TensorFlow/Keras integration for Morse-to-Text AI decoding.
 
-Model architecture (from training inspection):
-    - Tokenizer : Keras Tokenizer  { '.': 1, '-': 2 }
-    - Encoder   : sklearn LabelEncoder, 36 classes  (0-9, A-Z)
-    - Model     : input_shape=(32, 10)  output_shape=(32, 36)
-                  → Character-level classifier: maps one Morse symbol
-                    sequence (≤10 dots/dashes) to one predicted character.
+New Model Architecture (morse_decoder_v2.keras):
+    - Tokenizer : Keras Tokenizer  {dot: 1, dash: 2, space: 3}
+    - Model     : Bidirectional LSTM Seq2Seq
+                  input_shape  = (None, 108)    -- character-level tokens
+                  output_shape = (None, 108, 4) -- softmax over
+                                                   {0: pad, 1: dot, 2: dash, 3: space}
 
-Inference strategy:
-    1. Split the full Morse string into per-character codes (split on space,
-       use ' / ' as word boundary → space character).
-    2. For each Morse code, tokenise the dot/dash sequence and pad to len=10.
-    3. Batch-predict all characters in a single model.predict() call.
-    4. Decode each predicted index via LabelEncoder.classes_.
-    5. Aggregate confidence as mean(max(softmax)) across all characters.
+Inference Strategy (v2):
+    1. Tokenise the full noisy Morse string character-by-character.
+    2. Pad/truncate to MODEL_SEQ_LEN (108).
+    3. model.predict() -> corrected Morse token sequence.
+    4. Convert token indices back to Morse chars.
+    5. Decode corrected Morse via ITU dictionary.
+    6. Confidence = mean(max_softmax) over non-padded positions.
 
-Text → Morse:
-    Uses the built-in ITU Morse dictionary.
-    Unsupported characters are silently skipped (no '?' emission).
-
-All events are logged via utils.logger AND printed to stdout so they appear
-in the VS Code terminal even when the GUI is running.
+No LabelEncoder / encoder.pkl required.
+All events logged via utils.logger AND printed to stdout.
 """
 
 import os
 import pickle
-import sys
 import time
 import traceback
 import warnings
-import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -41,57 +35,48 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# ── Suppress TF C++ noise (set BEFORE importing TF) ──────────────────────────
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
-# ── Absolute paths relative to project root ───────────────────────────────────
 BASE_DIR       = Path(__file__).resolve().parent.parent
-MODEL_PATH     = BASE_DIR / "models" / "morse_decoder.h5"
+MODEL_PATH     = BASE_DIR / "models" / "morse_decoder_v2.keras"
 TOKENIZER_PATH = BASE_DIR / "models" / "tokenizer.pkl"
-ENCODER_PATH   = BASE_DIR / "models" / "encoder.pkl"
 
-# Model input sequence length (must match training)
-MODEL_SEQ_LEN = 10
+# Model max sequence length (must match training)
+MODEL_SEQ_LEN = 108
 
-# Confidence threshold below which prediction is flagged as "low confidence"
+# Output vocabulary: index -> Morse character
+# 0 = padding (ignored), 1 = dot, 2 = dash, 3 = space
+IDX_TO_MORSE = {0: "", 1: ".", 2: "-", 3: " "}
+
 LOW_CONFIDENCE_THRESHOLD = 0.60
 
-# ── Module-level state ────────────────────────────────────────────────────────
 _model        = None
 _tokenizer    = None
-_encoder      = None
 _model_loaded = False
 
-# ── Standard Morse Code Dictionary (ITU) ─────────────────────────────────────
-MORSE_CODE_DICT: dict[str, str] = {
-    'A': '.-',    'B': '-...',  'C': '-.-.',  'D': '-..',   'E': '.',
-    'F': '..-.',  'G': '--.',   'H': '....',  'I': '..',    'J': '.---',
-    'K': '-.-',   'L': '.-..',  'M': '--',    'N': '-.',    'O': '---',
-    'P': '.--.',  'Q': '--.-',  'R': '.-.',   'S': '...',   'T': '-',
-    'U': '..-',   'V': '...-',  'W': '.--',   'X': '-..-',  'Y': '-.--',
-    'Z': '--..',
-    '0': '-----', '1': '.----', '2': '..---', '3': '...--', '4': '....-',
-    '5': '.....', '6': '-....', '7': '--...', '8': '---..',  '9': '----.',
-    '.': '.-.-.-', ',': '--..--', '?': '..--..', "'": '.----.',
-    '!': '-.-.--', '/': '-..-.',  '(': '-.--.',  ')': '-.--.-',
-    '&': '.-...',  ':': '---...', ';': '-.-.-.',  '=': '-...-',
-    '+': '.-.-.',  '-': '-....-', '_': '..--.-',  '"': '.-..-.',
-    '$': '...-..-', '@': '.--.-.',
+MORSE_CODE_DICT = {
+    "A": ".-",    "B": "-...",  "C": "-.-.",  "D": "-..",   "E": ".",
+    "F": "..-.",  "G": "--.",   "H": "....",  "I": "..",    "J": ".---",
+    "K": "-.-",   "L": ".-..",  "M": "--",    "N": "-.",    "O": "---",
+    "P": ".--.",  "Q": "--.-",  "R": ".-.",   "S": "...",   "T": "-",
+    "U": "..-",   "V": "...-",  "W": ".--",   "X": "-..-",  "Y": "-.--",
+    "Z": "--..",
+    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
+    "5": ".....", "6": "-....", "7": "--...", "8": "---..",  "9": "----.",
+    ".": ".-.-.-", ",": "--..--", "?": "..--..", "'": ".----.",
+    "!": "-.-.--", "/": "-..-.",  "(": "-.--.", ")": "-.--.-",
+    "&": ".-...",  ":": "---...", ";": "-.-.-.",  "=": "-...-",
+    "+": ".-.-.",  "-": "-....-", "_": "..--..",  '"': ".-..-.",
+    "$": "...-..-", "@": ".--.-.",
 }
 
-MORSE_REVERSE_DICT: dict[str, str] = {v: k for k, v in MORSE_CODE_DICT.items()}
-SUPPORTED_CHARS = set(MORSE_CODE_DICT.keys())
+MORSE_REVERSE_DICT = {v: k for k, v in MORSE_CODE_DICT.items()}
+SUPPORTED_CHARS    = set(MORSE_CODE_DICT.keys())
 
-
-# ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _diag_print(msg: str) -> None:
-    """Print msg to stdout (VS Code terminal) AND log at INFO level.
-
-    Handles consoles that cannot encode specific Unicode by falling back
-    to ASCII-safe output for the print() call.
-    """
+    """Print msg to stdout AND log at INFO level."""
     try:
         print(msg, flush=True)
     except UnicodeEncodeError:
@@ -100,87 +85,106 @@ def _diag_print(msg: str) -> None:
     log.info(msg)
 
 
-def _inspect_h5_file(path: Path) -> str:
+# ---------------------------------------------------------------------------
+# Levenshtein fuzzy Morse correction
+# ---------------------------------------------------------------------------
+# ROOT CAUSE NOTE (2026-08-07 diagnostic):
+#   The model performs PURE IDENTITY MAPPING on 100% of test inputs.
+#   Every output token equals the input token -- no correction occurs.
+#   This is a training failure where the model learned the trivial copy
+#   solution.  See module docstring for recommended training fixes.
+#
+# INFERENCE MITIGATION:
+#   1. Identity mapping is detected and logged as a warning per call.
+#   2. Unrecognized Morse codes (e.g. '.-.-') are fuzzy-corrected via
+#      Levenshtein nearest-neighbour (edit distance <= 1).
+#   3. VALID but wrong codes (e.g. '--.' when '---' expected) cannot
+#      be fixed in inference; they require model retraining.
+
+def _levenshtein(s1: str, s2: str) -> int:
+    """Compute the Levenshtein (edit) distance between two strings."""
+    m, n = len(s1), len(s2)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            if s1[i - 1] == s2[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n]
+
+
+def _fuzzy_decode_symbol(code: str) -> tuple:
     """
-    Inspect the .h5 file to determine its actual format and report findings.
-    Returns a human-readable ASCII-safe description string.
-    """
-    lines: list[str] = []
-    try:
-        with open(path, "rb") as fh:
-            header = fh.read(16)
-        lines.append(f"  File header (hex): {header.hex()}")
+    Decode one Morse symbol to a character.
 
-        # HDF5 magic bytes: \x89HDF\r\n\x1a\n
-        if header[:8] == b"\x89HDF\r\n\x1a\n":
-            lines.append("  Format: HDF5 (legacy .h5 format) - OK")
-        elif zipfile.is_zipfile(path):
-            lines.append("  Format: ZIP archive (Keras v3 / SavedModel format)")
-            with zipfile.ZipFile(path) as z:
-                contents = z.namelist()[:15]
-                lines.append(f"  ZIP contents: {contents}")
-        else:
-            lines.append("  Format: UNKNOWN - not HDF5 and not ZIP")
-    except Exception as exc:
-        lines.append(f"  Inspection error: {exc}")
-
-    # Try h5py
-    try:
-        import h5py
-        with h5py.File(path, "r") as hf:
-            lines.append(f"  h5py keys: {list(hf.keys())}")
-    except ImportError:
-        lines.append("  h5py: not installed (pip install h5py)")
-    except Exception as exc:
-        lines.append(f"  h5py error: {exc}")
-
-    return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Model Loading
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_ai_model(
-    model_path:     str | Path = MODEL_PATH,
-    tokenizer_path: str | Path = TOKENIZER_PATH,
-    encoder_path:   str | Path = ENCODER_PATH,
-) -> tuple[bool, str]:
-    """
-    Load the TensorFlow model, Keras tokenizer, and sklearn LabelEncoder.
+    Strategy:
+      1. Exact ITU dictionary lookup (always preferred).
+      2. Levenshtein nearest-neighbour over all valid codes
+         (accepted if edit distance <= 1).
+      3. Returns '?' if no match within threshold.
 
     Returns:
-        ``(True, "AI Loaded")`` on success.
-        ``(False, full_exception_string)`` on any failure – never hidden.
-
-    All steps are printed to stdout AND written to logs/app.log.
+        (character, method_tag, edit_distance)
+        method_tag: 'exact' | 'fuzzy' | 'unknown'
     """
-    global _model, _tokenizer, _encoder, _model_loaded
+    MAX_EDIT_DIST = 1
+    code = code.strip()
+    if not code:
+        return ("", "empty", 0)
+
+    if code in MORSE_REVERSE_DICT:
+        return (MORSE_REVERSE_DICT[code], "exact", 0)
+
+    best_char = None
+    best_dist = MAX_EDIT_DIST + 1
+    best_code = None
+    for valid_morse, char in MORSE_REVERSE_DICT.items():
+        d = _levenshtein(code, valid_morse)
+        if d < best_dist or (d == best_dist and len(valid_morse) == len(code)):
+            best_dist = d
+            best_char = char
+            best_code = valid_morse
+
+    if best_dist <= MAX_EDIT_DIST:
+        return (best_char, "fuzzy", best_dist)
+    return ("?", "unknown", best_dist)
+
+
+def load_ai_model(model_path=MODEL_PATH, tokenizer_path=TOKENIZER_PATH):
+    """
+    Load the TensorFlow Seq2Seq Keras model and Keras tokenizer.
+
+    No LabelEncoder / encoder.pkl required by the new architecture.
+
+    Returns:
+        (True, "AI Loaded") on success.
+        (False, full_exception_string) on failure.
+    """
+    global _model, _tokenizer, _model_loaded
 
     if _model_loaded:
-        _diag_print("AI model already loaded – skipping reload.")
+        _diag_print("AI model already loaded - skipping reload.")
         return (True, "AI Loaded")
 
     model_path     = Path(model_path)
     tokenizer_path = Path(tokenizer_path)
-    encoder_path   = Path(encoder_path)
 
-    # ── Diagnostic header ────────────────────────────────────────────────────
     sep = "-" * 50
     _diag_print(sep)
-    _diag_print("Loading AI Model...")
+    _diag_print("Loading AI Model (v2 - Seq2Seq Denoising)...")
     _diag_print(f"Model path:       {model_path}")
     _diag_print(f"Tokenizer path:   {tokenizer_path}")
-    _diag_print(f"Encoder path:     {encoder_path}")
     _diag_print(f"Current Working Directory: {os.getcwd()}")
 
-    # ── File existence ────────────────────────────────────────────────────────
     model_exists     = model_path.exists()
     tokenizer_exists = tokenizer_path.exists()
-    encoder_exists   = encoder_path.exists()
     _diag_print(f"Model exists:     {model_exists}")
     _diag_print(f"Tokenizer exists: {tokenizer_exists}")
-    _diag_print(f"Encoder exists:   {encoder_exists}")
     if model_exists:
         _diag_print(f"Model file size:  {model_path.stat().st_size:,} bytes")
 
@@ -194,27 +198,20 @@ def load_ai_model(
         _diag_print(f"ERROR: {msg}")
         _diag_print(sep)
         return (False, msg)
-    if not encoder_exists:
-        msg = f"Encoder not found: {encoder_path}"
-        _diag_print(f"ERROR: {msg}")
-        _diag_print(sep)
-        return (False, msg)
 
-    # ── TensorFlow import ─────────────────────────────────────────────────────
     _diag_print("")
     _diag_print("Importing TensorFlow...")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             import tensorflow as tf
-            from tensorflow.keras.models import load_model as _keras_load
-            from tensorflow.keras.preprocessing.sequence import pad_sequences as _pad  # noqa: F401
+            from tensorflow.keras.preprocessing.sequence import pad_sequences  # noqa
         _diag_print(f"TensorFlow Version: {tf.__version__}")
         try:
             _diag_print(f"Keras Version:      {tf.keras.__version__}")
         except Exception:
             pass
-    except ImportError as exc:
+    except ImportError:
         tb = traceback.format_exc()
         msg = f"TensorFlow not installed.\n\nTraceback:\n{tb}"
         _diag_print("ERROR: TensorFlow not installed:")
@@ -229,7 +226,6 @@ def load_ai_model(
         _diag_print(sep)
         return (False, msg)
 
-    # ── Tokenizer ─────────────────────────────────────────────────────────────
     _diag_print("")
     _diag_print("Loading tokenizer...")
     try:
@@ -246,214 +242,279 @@ def load_ai_model(
         _diag_print(sep)
         return (False, msg)
 
-    # ── Encoder ───────────────────────────────────────────────────────────────
     _diag_print("")
-    _diag_print("Loading label encoder...")
+    _diag_print("Loading Keras model (.keras)...")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with open(encoder_path, "rb") as fh:
-                _encoder = pickle.load(fh)
-        _diag_print(f"Encoder Type:      {type(_encoder).__name__}")
-        _diag_print(f"Encoder Classes:   {list(_encoder.classes_)}")
-        _diag_print(f"Number of Classes: {len(_encoder.classes_)}")
-    except Exception as exc:
-        tb = traceback.format_exc()
-        msg = f"Failed to load encoder: {exc}\n\nTraceback:\n{tb}"
-        _diag_print("ERROR: Encoder load failed:")
-        _diag_print(tb)
-        _diag_print(sep)
-        return (False, msg)
-
-    # ── Keras model ───────────────────────────────────────────────────────────
-    _diag_print("")
-    _diag_print("Loading Keras model (.h5)...")
-
-    # First inspect the file format
-    _diag_print("  Inspecting model file format:")
-    _diag_print(_inspect_h5_file(model_path))
-
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            _model = _keras_load(str(model_path))
+            _model = tf.keras.models.load_model(str(model_path), compile=False)
         _diag_print(f"Model Input Shape:  {_model.input_shape}")
         _diag_print(f"Model Output Shape: {_model.output_shape}")
+        _diag_print("Model Type:         Seq2Seq Denoising (BiLSTM)")
     except Exception as exc:
         tb = traceback.format_exc()
         full_err = f"Failed to load model: {type(exc).__name__}: {exc}"
         msg = f"{full_err}\n\nTraceback:\n{tb}"
-        _diag_print("ERROR: Keras model load failed – full traceback:")
+        _diag_print("ERROR: Keras model load failed - full traceback:")
         _diag_print(tb)
-
-        # Attempt compile=False fallback
-        _diag_print("Retrying with compile=False...")
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                _model = _keras_load(str(model_path), compile=False)
-            _diag_print(f"compile=False succeeded!  Input={_model.input_shape}  Output={_model.output_shape}")
-        except Exception as exc2:
-            tb2 = traceback.format_exc()
-            _diag_print("compile=False also failed:")
-            _diag_print(tb2)
-            full_msg = (
-                f"{full_err}\n\nTraceback:\n{tb}"
-                f"\n\nRetry (compile=False) also failed:\n"
-                f"{type(exc2).__name__}: {exc2}\n{tb2}"
-            )
-            _diag_print(sep)
-            return (False, full_msg)
+        _diag_print(sep)
+        return (False, msg)
 
     _model_loaded = True
     _diag_print("")
-    _diag_print("SUCCESS: AI model fully loaded and ready.")
+    _diag_print("SUCCESS: AI model (v2) fully loaded and ready.")
+    _diag_print("  Architecture : Seq2Seq Bidirectional LSTM")
+    _diag_print(f"  Input length : {MODEL_SEQ_LEN} (character tokens)")
+    _diag_print("  Output vocab : 4 classes (pad / dot / dash / space)")
     _diag_print(sep)
     return (True, "AI Loaded")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Inference
-# ══════════════════════════════════════════════════════════════════════════════
-
-def decode_morse(morse_input: str) -> tuple[str, float, float, str]:
+def decode_morse(morse_input: str) -> tuple:
     """
-    Decode Morse code to text.
+    Decode Morse code to plain text.
 
-    When the AI model is loaded → TensorFlow character-level inference.
-    When not yet loaded         → dictionary fallback.
+    When AI model is loaded  -> Seq2Seq denoising + dictionary decode.
+    When not yet loaded      -> dictionary fallback (no noise correction).
 
     Returns:
         (decoded_text, confidence, elapsed_seconds, method)
-
-        - confidence:     0.0–1.0 (0.0 for dictionary fallback)
-        - elapsed_seconds: wall-clock time for the inference call
-        - method:         "AI" or "Dictionary"
     """
     t0 = time.perf_counter()
     if not _model_loaded:
         text, conf = _fallback_decode(morse_input)
         elapsed = time.perf_counter() - t0
-        log.debug("Dictionary decode: '%s' → '%s' (%.3fs)", morse_input[:30], text[:30], elapsed)
+        log.debug("Dictionary decode: '%s' -> '%s' (%.3fs)",
+                  morse_input[:30], text[:30], elapsed)
         return (text, conf, elapsed, "Dictionary")
 
     try:
         text, conf = _ai_decode(morse_input)
         elapsed = time.perf_counter() - t0
-        log.debug("AI decode: '%s' → '%s' conf=%.2f (%.3fs)",
+        log.debug("AI decode: '%s' -> '%s' conf=%.2f (%.3fs)",
                   morse_input[:30], text[:30], conf, elapsed)
         return (text, conf, elapsed, "AI")
-    except Exception as exc:
+    except Exception:
         log.exception("AI inference error.")
         elapsed = time.perf_counter() - t0
         return ("Prediction failed", 0.0, elapsed, "AI (error)")
 
 
-def _ai_decode(morse_input: str) -> tuple[str, float]:
+def _ai_decode(morse_input: str) -> tuple:
     """
-    Run the trained character-level Keras model.
+    Run the Seq2Seq Keras model and decode the corrected Morse string.
 
-    Strategy:
-        • The model maps ONE Morse symbol sequence → ONE character.
-        • Input shape is (batch, 10) – each row is a padded dot/dash sequence.
-        • ' / ' in the Morse string denotes a word boundary (space in output).
+    Full debug trace is emitted at DEBUG log level for every call.
+    Identity mapping (model output == input) is detected and warned.
+    Unrecognized Morse codes are fuzzy-corrected via Levenshtein distance.
+
+    NOTE: Diagnostic (2026-08-07) confirmed the model performs PURE IDENTITY
+    MAPPING on all inputs -- it copies tokens unchanged.  This is a training
+    failure.  See module docstring for training recommendations.
+    Fuzzy correction mitigates the '?' symptom for invalid codes only.
+
+    Returns:
+        (decoded_text, confidence)
     """
     from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-    word_index = _tokenizer.word_index   # {'.': 1, '-': 2}
-
-    words = morse_input.strip().split(" / ")
-    all_codes:   list[str] = []
-    word_breaks: list[int] = []
-
-    for w_idx, word in enumerate(words):
-        codes = [c for c in word.strip().split(" ") if c]
-        all_codes.extend(codes)
-        if w_idx < len(words) - 1:
-            word_breaks.append(len(all_codes))
-
-    if not all_codes:
+    morse_input = morse_input.strip()
+    if not morse_input:
         return ("", 0.0)
 
-    # Tokenise: each dot/dash character → integer index
-    sequences = [
-        [word_index.get(ch, 0) for ch in code]
-        for code in all_codes
-    ]
+    # ── Step 1: Tokenise character-by-character ───────────────────────────────
+    # Keras Tokenizer maps: '.' -> 1, '-' -> 2, ' ' -> 3.
+    # Unknown chars (e.g. '/') are silently dropped (mapped to nothing).
+    sequences       = _tokenizer.texts_to_sequences([morse_input])
+    token_seq       = sequences[0]
+    input_token_len = len(token_seq)
 
-    # Pad to MODEL_SEQ_LEN
-    padded = pad_sequences(sequences, maxlen=MODEL_SEQ_LEN,
-                           padding="post", truncating="post")
+    log.debug("[AI v2] Step 1 | Input: %r", morse_input)
+    log.debug("[AI v2] Step 1 | Tokens (%d): %s", input_token_len, token_seq)
 
-    # Batch predict → shape (n_chars, n_classes)
-    raw_preds    = _model.predict(padded, verbose=0)
-    pred_indices = np.argmax(raw_preds, axis=-1)
-    pred_probs   = raw_preds[np.arange(len(raw_preds)), pred_indices]
-    confidence   = float(np.mean(pred_probs))
+    if input_token_len == 0:
+        log.warning("[AI v2] Tokenizer produced 0 tokens for input %r", morse_input)
+        return ("", 0.0)
 
-    classes = _encoder.classes_
-    chars = [
-        str(classes[idx]) if 0 <= idx < len(classes) else "?"
-        for idx in pred_indices
-    ]
+    # ── Step 2: Pad to MODEL_SEQ_LEN ─────────────────────────────────────────
+    padded = pad_sequences(
+        [token_seq],
+        maxlen=MODEL_SEQ_LEN,
+        padding="post",
+        truncating="post",
+    )
+    log.debug("[AI v2] Step 2 | Padded shape: %s  first20: %s",
+              padded.shape, padded[0][:20].tolist())
 
-    # Re-insert word boundaries
-    result_parts: list[str] = []
-    prev = 0
-    for brk in sorted(word_breaks):
-        result_parts.append("".join(chars[prev:brk]))
-        prev = brk
-    result_parts.append("".join(chars[prev:]))
-    decoded_text = " ".join(result_parts)
+    # ── Step 3: Predict -> shape (1, MODEL_SEQ_LEN, 4) ───────────────────────
+    raw_preds = _model.predict(padded, verbose=0)
+    pred_0    = raw_preds[0]                        # (108, 4)
 
+    # ── Step 4: argmax -> token indices ──────────────────────────────────────
+    pred_indices = np.argmax(pred_0, axis=-1)       # (108,)
+    pred_probs   = np.max(pred_0, axis=-1)          # (108,)
+
+    # ── Step 5 & 6: Reconstruct corrected Morse, trim to input length ─────────
+    active_len     = min(input_token_len, MODEL_SEQ_LEN)
+    active_indices = pred_indices[:active_len]
+    active_probs   = pred_probs[:active_len]
+
+    # ── Identity-mapping detection ────────────────────────────────────────────
+    # Count how many output tokens equal the corresponding input token.
+    # 100% identity = model learned to copy input (training failure).
+    n_identical    = sum(1 for i in range(active_len)
+                        if int(active_indices[i]) == token_seq[i])
+    identity_ratio = n_identical / active_len if active_len > 0 else 0.0
+
+    if identity_ratio >= 1.0:
+        log.warning(
+            "[AI v2] IDENTITY MAPPING: output == input for all %d positions. "
+            "Model learned to copy input (training failure). "
+            "Fuzzy correction active for invalid codes.",
+            active_len,
+        )
+    elif identity_ratio >= 0.8:
+        log.warning(
+            "[AI v2] Near-identity mapping: %.0f%% of positions unchanged.",
+            identity_ratio * 100,
+        )
+
+    log.debug(
+        "[AI v2] Step 4 | Identity ratio: %.1f%% (%d/%d positions unchanged)",
+        identity_ratio * 100, n_identical, active_len,
+    )
+
+    # Per-position trace (DEBUG level only)
+    for i in range(active_len):
+        in_tok  = token_seq[i]
+        out_tok = int(active_indices[i])
+        in_chr  = IDX_TO_MORSE.get(in_tok, "?")
+        out_chr = IDX_TO_MORSE.get(out_tok, "?")
+        prob    = float(active_probs[i])
+        p4      = [round(float(pred_0[i][j]), 4) for j in range(4)]
+        changed = "" if in_tok == out_tok else "  <-- CHANGED"
+        log.debug(
+            "[AI v2]  pos=%02d  in=%d(%r)  out=%d(%r)  prob=%.4f  p4=%s%s",
+            i, in_tok, in_chr, out_tok, out_chr, prob, p4, changed,
+        )
+
+    # ── Build corrected Morse string ──────────────────────────────────────────
+    corrected_chars = [IDX_TO_MORSE.get(int(i), "") for i in active_indices]
+    corrected_morse = "".join(corrected_chars).strip()
+    log.debug("[AI v2] Step 5 | Corrected Morse: %r", corrected_morse)
+
+    # ── Step 7: Decode corrected Morse -> plain text ──────────────────────────
+    decoded_text = _decode_corrected_morse(corrected_morse)
+
+    # ── Step 8: Confidence ────────────────────────────────────────────────────
+    confidence = float(np.mean(active_probs))
+
+    log.debug(
+        "[AI v2] Result | noisy=%r -> corrected=%r -> text=%r "
+        "| conf=%.3f | identity=%.0f%%",
+        morse_input[:40], corrected_morse[:40], decoded_text[:40],
+        confidence, identity_ratio * 100,
+    )
     return (decoded_text, confidence)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Text → Morse Encoding
-# ══════════════════════════════════════════════════════════════════════════════
+def _decode_corrected_morse(corrected_morse: str) -> str:
+    """
+    Convert a corrected character-level Morse string to plain text.
+
+    Decoding strategy per symbol:
+      1. Exact ITU dictionary lookup (preferred).
+      2. Levenshtein fuzzy correction (edit distance <= 1) for invalid codes.
+      3. Returns '?' if no valid match found within threshold.
+
+    Word separator:   ' / '  (space-slash-space)
+    Letter separator: single space ' '
+
+    NOTE: This fuzzy layer handles cases where the model passes through
+    invalid Morse codes unchanged (identity-mapping failure).  It cannot
+    fix valid-but-wrong codes (e.g. '--.' vs '---') -- those require
+    a retrained model.
+    """
+    corrected_morse = corrected_morse.strip()
+    if not corrected_morse:
+        return ""
+
+    if " / " in corrected_morse:
+        word_chunks = corrected_morse.split(" / ")
+    else:
+        word_chunks = [corrected_morse]
+
+    decoded_words = []
+    fuzzy_count   = 0
+    unknown_count = 0
+
+    for chunk in word_chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        letters = []
+        for code in chunk.split(" "):
+            code = code.strip()
+            if not code:
+                continue
+            char, method, dist = _fuzzy_decode_symbol(code)
+            if method == "fuzzy":
+                fuzzy_count += 1
+                log.debug("[Fuzzy] %r not in dict -> %r (edit_dist=%d)", code, char, dist)
+            elif method == "unknown":
+                unknown_count += 1
+                log.debug("[Unknown] %r has no valid Morse match (edit_dist=%d)", code, dist)
+            letters.append(char)
+        if letters:
+            decoded_words.append("".join(letters))
+
+    if fuzzy_count > 0:
+        log.debug("[AI v2] Fuzzy corrections applied: %d symbols.", fuzzy_count)
+    if unknown_count > 0:
+        log.debug(
+            "[AI v2] %d unrecognized symbols output as '?' "
+            "(invalid Morse codes the model passed through unchanged).",
+            unknown_count,
+        )
+
+    return " ".join(decoded_words)
+
 
 def encode_text(text: str) -> str:
     """
     Encode plain text to Morse code using the standard ITU dictionary.
 
-    Supported characters: A–Z, 0–9, space, and .,?/-  (plus several others).
+    Supported: A-Z, 0-9, space, and punctuation (see MORSE_CODE_DICT).
     Unsupported characters are silently skipped.
 
     Returns:
-        Morse string: characters separated by single spaces, words by ' / '.
+        Morse string with letters separated by spaces, words by ' / '.
     """
     words = text.upper().strip().split()
-    morse_words: list[str] = []
+    morse_words = []
     for word in words:
         codes = [MORSE_CODE_DICT[ch] for ch in word if ch in MORSE_CODE_DICT]
         if codes:
             morse_words.append(" ".join(codes))
     result = " / ".join(morse_words)
-    log.debug("Encoded text (len=%d) → morse (len=%d).", len(text), len(result))
+    log.debug("Encoded text (len=%d) -> morse (len=%d).", len(text), len(result))
     return result
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
 def is_model_loaded() -> bool:
-    """Return ``True`` when the AI model is loaded and ready for inference."""
+    """Return True when the AI model is loaded and ready for inference."""
     return _model_loaded
 
 
 def get_model_info() -> dict:
     """Return a debug summary of the loaded model state."""
-    info: dict = {
-        "model_loaded":    _model_loaded,
-        "model_path":      str(MODEL_PATH),
-        "tokenizer_type":  type(_tokenizer).__name__ if _tokenizer else "None",
-        "encoder_type":    type(_encoder).__name__   if _encoder   else "None",
-        "encoder_classes": (
-            len(_encoder.classes_)
-            if _encoder and hasattr(_encoder, "classes_") else 0
-        ),
+    info = {
+        "model_loaded":   _model_loaded,
+        "model_path":     str(MODEL_PATH),
+        "tokenizer_type": type(_tokenizer).__name__ if _tokenizer else "None",
+        "model_version":  "v2 (Seq2Seq Denoising BiLSTM)",
+        "seq_len":        MODEL_SEQ_LEN,
+        "output_vocab":   IDX_TO_MORSE,
     }
     if _model is not None:
         if hasattr(_model, "input_shape"):
@@ -463,18 +524,22 @@ def get_model_info() -> dict:
     return info
 
 
-def _fallback_decode(morse_input: str) -> tuple[str, float]:
+def _fallback_decode(morse_input: str) -> tuple:
     """
     Dictionary-based Morse decoding used when the AI model is not loaded.
 
-    Returns ``(decoded_text, 0.0)`` – confidence is always 0.0 to indicate
-    no AI was involved.
+    Uses fuzzy Levenshtein correction for unrecognized Morse codes.
+    Returns (decoded_text, 0.0) -- confidence is always 0.0.
     """
     words = morse_input.strip().split(" / ")
-    decoded_words: list[str] = []
+    decoded_words = []
     for word in words:
         tokens = word.strip().split(" ")
-        decoded_words.append(
-            "".join(MORSE_REVERSE_DICT.get(t.strip(), "?") for t in tokens if t)
-        )
+        letters = []
+        for t in tokens:
+            t = t.strip()
+            if t:
+                char, method, dist = _fuzzy_decode_symbol(t)
+                letters.append(char)
+        decoded_words.append("".join(letters))
     return (" ".join(decoded_words), 0.0)
