@@ -74,7 +74,7 @@ LoRaShield-Software
 Clone the repository
 
 ```bash
-git clone https://github.com/<username>/LoRaShield-Software.git
+git clone https://github.com/prashantmalagi/LoRaShield-Software.git
 ```
 
 Move into the project
