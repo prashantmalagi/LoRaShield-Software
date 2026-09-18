@@ -1,29 +1,29 @@
 """
-LoRaShield - AI Utility Module (v2)
+LoRaShield - AI Utility Module (v4)
 =====================================
 TensorFlow/Keras integration for Morse-to-Text AI decoding.
 
-New Model Architecture (morse_decoder_v2.keras):
-    - Tokenizer : Keras Tokenizer  {dot: 1, dash: 2, space: 3}
-    - Model     : Bidirectional LSTM Seq2Seq
-                  input_shape  = (None, 108)    -- character-level tokens
-                  output_shape = (None, 108, 4) -- softmax over
-                                                   {0: pad, 1: dot, 2: dash, 3: space}
+Model Architecture (morse_decoder_v4.keras):
+    - Vocab     : vocab_v4.json
+                  CHAR_TO_IDX : {'<PAD>': 0, '<UNK>': 1, '.': 2, '-': 3, ' ': 4, '/': 5}
+                  TARGET_CHARS: ['<PAD>', 'A'-'Z', '0'-'9', ' ']  (38 classes)
+    - Model     : Direct Morse-to-text decoder
+                  input_shape  = (None, MAX_MORSE_LEN)   -- Morse char tokens
+                  output_shape = (None, MAX_TEXT_LEN, 38) -- softmax over target chars
 
-Inference Strategy (v2):
-    1. Tokenise the full noisy Morse string character-by-character.
-    2. Pad/truncate to MODEL_SEQ_LEN (108).
-    3. model.predict() -> corrected Morse token sequence.
-    4. Convert token indices back to Morse chars.
-    5. Decode corrected Morse via ITU dictionary.
-    6. Confidence = mean(max_softmax) over non-padded positions.
+Inference Strategy (v4):
+    1. Tokenise the full Morse string character-by-character using CHAR_TO_IDX.
+    2. Pad/truncate to MAX_MORSE_LEN (120).
+    3. model.predict() -> decoded text token sequence (MAX_TEXT_LEN, 38).
+    4. argmax -> target character indices.
+    5. Map indices via TARGET_CHARS, strip padding.
+    6. Confidence = mean(max_softmax) over non-padding positions.
 
-No LabelEncoder / encoder.pkl required.
+No pickle tokenizer required — vocab is loaded from vocab_v4.json.
 All events logged via utils.logger AND printed to stdout.
 """
 
 import os
-import pickle
 import time
 import traceback
 import warnings
@@ -39,20 +39,17 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 BASE_DIR       = Path(__file__).resolve().parent.parent
-MODEL_PATH     = BASE_DIR / "models" / "morse_decoder_v2.keras"
-TOKENIZER_PATH = BASE_DIR / "models" / "tokenizer.pkl"
+MODEL_PATH     = BASE_DIR / "models" / "morse_decoder_v4 (1).keras"
+VOCAB_PATH     = BASE_DIR / "models" / "vocab_v4.json"
 
-# Model max sequence length (must match training)
-MODEL_SEQ_LEN = 108
-
-# Output vocabulary: index -> Morse character
-# 0 = padding (ignored), 1 = dot, 2 = dash, 3 = space
-IDX_TO_MORSE = {0: "", 1: ".", 2: "-", 3: " "}
+# Sequence lengths (must match training — loaded from vocab at runtime)
+MAX_MORSE_LEN = 120   # default; overridden by vocab_v4.json
+MAX_TEXT_LEN  = 25    # default; overridden by vocab_v4.json
 
 LOW_CONFIDENCE_THRESHOLD = 0.60
 
 _model        = None
-_tokenizer    = None
+_vocab        = None   # dict loaded from vocab_v4.json
 _model_loaded = False
 
 MORSE_CODE_DICT = {
@@ -155,36 +152,37 @@ def _fuzzy_decode_symbol(code: str) -> tuple:
     return ("?", "unknown", best_dist)
 
 
-def load_ai_model(model_path=MODEL_PATH, tokenizer_path=TOKENIZER_PATH):
+def load_ai_model(model_path=MODEL_PATH, tokenizer_path=None):
     """
-    Load the TensorFlow Seq2Seq Keras model and Keras tokenizer.
+    Load the TensorFlow v4 Keras model and vocab_v4.json vocabulary.
 
-    No LabelEncoder / encoder.pkl required by the new architecture.
+    tokenizer_path is accepted but ignored (kept for API compatibility).
+    The vocab is loaded from VOCAB_PATH (vocab_v4.json).
 
     Returns:
         (True, "AI Loaded") on success.
         (False, full_exception_string) on failure.
     """
-    global _model, _tokenizer, _model_loaded
+    global _model, _vocab, _model_loaded, MAX_MORSE_LEN, MAX_TEXT_LEN
 
     if _model_loaded:
         _diag_print("AI model already loaded - skipping reload.")
         return (True, "AI Loaded")
 
-    model_path     = Path(model_path)
-    tokenizer_path = Path(tokenizer_path)
+    model_path = Path(model_path)
+    vocab_path = VOCAB_PATH
 
     sep = "-" * 50
     _diag_print(sep)
-    _diag_print("Loading AI Model (v2 - Seq2Seq Denoising)...")
+    _diag_print("Loading AI Model (v4 - Direct Morse-to-Text)...")
     _diag_print(f"Model path:       {model_path}")
-    _diag_print(f"Tokenizer path:   {tokenizer_path}")
+    _diag_print(f"Vocab path:       {vocab_path}")
     _diag_print(f"Current Working Directory: {os.getcwd()}")
 
-    model_exists     = model_path.exists()
-    tokenizer_exists = tokenizer_path.exists()
+    model_exists = model_path.exists()
+    vocab_exists = vocab_path.exists()
     _diag_print(f"Model exists:     {model_exists}")
-    _diag_print(f"Tokenizer exists: {tokenizer_exists}")
+    _diag_print(f"Vocab exists:     {vocab_exists}")
     if model_exists:
         _diag_print(f"Model file size:  {model_path.stat().st_size:,} bytes")
 
@@ -193,8 +191,8 @@ def load_ai_model(model_path=MODEL_PATH, tokenizer_path=TOKENIZER_PATH):
         _diag_print(f"ERROR: {msg}")
         _diag_print(sep)
         return (False, msg)
-    if not tokenizer_exists:
-        msg = f"Tokenizer not found: {tokenizer_path}"
+    if not vocab_exists:
+        msg = f"Vocab file not found: {vocab_path}"
         _diag_print(f"ERROR: {msg}")
         _diag_print(sep)
         return (False, msg)
@@ -205,7 +203,6 @@ def load_ai_model(model_path=MODEL_PATH, tokenizer_path=TOKENIZER_PATH):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             import tensorflow as tf
-            from tensorflow.keras.preprocessing.sequence import pad_sequences  # noqa
         _diag_print(f"TensorFlow Version: {tf.__version__}")
         try:
             _diag_print(f"Keras Version:      {tf.keras.__version__}")
@@ -227,17 +224,22 @@ def load_ai_model(model_path=MODEL_PATH, tokenizer_path=TOKENIZER_PATH):
         return (False, msg)
 
     _diag_print("")
-    _diag_print("Loading tokenizer...")
+    _diag_print("Loading vocab (vocab_v4.json)...")
     try:
-        with open(tokenizer_path, "rb") as fh:
-            _tokenizer = pickle.load(fh)
-        _diag_print(f"Tokenizer Type:    {type(_tokenizer).__name__}")
-        _diag_print(f"Word Index:        {_tokenizer.word_index}")
-        _diag_print(f"Vocabulary Size:   {len(_tokenizer.word_index)}")
+        import json
+        with open(vocab_path, "r", encoding="utf-8") as fh:
+            _vocab = json.load(fh)
+        # Override sequence length constants from vocab file
+        MAX_MORSE_LEN = _vocab.get("MAX_MORSE_LEN", MAX_MORSE_LEN)
+        MAX_TEXT_LEN  = _vocab.get("MAX_TEXT_LEN",  MAX_TEXT_LEN)
+        _diag_print(f"CHAR_TO_IDX:       {_vocab['CHAR_TO_IDX']}")
+        _diag_print(f"Target vocab size: {len(_vocab['TARGET_CHARS'])}")
+        _diag_print(f"MAX_MORSE_LEN:     {MAX_MORSE_LEN}")
+        _diag_print(f"MAX_TEXT_LEN:      {MAX_TEXT_LEN}")
     except Exception as exc:
         tb = traceback.format_exc()
-        msg = f"Failed to load tokenizer: {exc}\n\nTraceback:\n{tb}"
-        _diag_print("ERROR: Tokenizer load failed:")
+        msg = f"Failed to load vocab: {exc}\n\nTraceback:\n{tb}"
+        _diag_print("ERROR: Vocab load failed:")
         _diag_print(tb)
         _diag_print(sep)
         return (False, msg)
@@ -250,7 +252,7 @@ def load_ai_model(model_path=MODEL_PATH, tokenizer_path=TOKENIZER_PATH):
             _model = tf.keras.models.load_model(str(model_path), compile=False)
         _diag_print(f"Model Input Shape:  {_model.input_shape}")
         _diag_print(f"Model Output Shape: {_model.output_shape}")
-        _diag_print("Model Type:         Seq2Seq Denoising (BiLSTM)")
+        _diag_print("Model Type:         Direct Morse-to-Text Decoder (v4)")
     except Exception as exc:
         tb = traceback.format_exc()
         full_err = f"Failed to load model: {type(exc).__name__}: {exc}"
@@ -262,10 +264,11 @@ def load_ai_model(model_path=MODEL_PATH, tokenizer_path=TOKENIZER_PATH):
 
     _model_loaded = True
     _diag_print("")
-    _diag_print("SUCCESS: AI model (v2) fully loaded and ready.")
-    _diag_print("  Architecture : Seq2Seq Bidirectional LSTM")
-    _diag_print(f"  Input length : {MODEL_SEQ_LEN} (character tokens)")
-    _diag_print("  Output vocab : 4 classes (pad / dot / dash / space)")
+    _diag_print("SUCCESS: AI model (v4) fully loaded and ready.")
+    _diag_print("  Architecture : Direct Morse-to-Text Decoder")
+    _diag_print(f"  Input length : {MAX_MORSE_LEN} (Morse char tokens)")
+    _diag_print(f"  Output length: {MAX_TEXT_LEN} (text chars)")
+    _diag_print(f"  Output vocab : {len(_vocab['TARGET_CHARS'])} classes")
     _diag_print(sep)
     return (True, "AI Loaded")
 
@@ -302,118 +305,71 @@ def decode_morse(morse_input: str) -> tuple:
 
 def _ai_decode(morse_input: str) -> tuple:
     """
-    Run the Seq2Seq Keras model and decode the corrected Morse string.
+    Run the v4 Keras model to directly decode a Morse string to plain text.
 
-    Full debug trace is emitted at DEBUG log level for every call.
-    Identity mapping (model output == input) is detected and warned.
-    Unrecognized Morse codes are fuzzy-corrected via Levenshtein distance.
-
-    NOTE: Diagnostic (2026-08-07) confirmed the model performs PURE IDENTITY
-    MAPPING on all inputs -- it copies tokens unchanged.  This is a training
-    failure.  See module docstring for training recommendations.
-    Fuzzy correction mitigates the '?' symptom for invalid codes only.
+    Steps:
+      1. Tokenise Morse string char-by-char using CHAR_TO_IDX from vocab.
+      2. Pad/truncate to MAX_MORSE_LEN.
+      3. model.predict() -> shape (1, MAX_TEXT_LEN, vocab_size).
+      4. argmax -> TARGET_CHARS indices.
+      5. Map to characters, strip <PAD> tokens.
+      6. Confidence = mean(max_softmax) over non-pad positions.
 
     Returns:
         (decoded_text, confidence)
     """
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
-
     morse_input = morse_input.strip()
     if not morse_input:
         return ("", 0.0)
 
-    # ── Step 1: Tokenise character-by-character ───────────────────────────────
-    # Keras Tokenizer maps: '.' -> 1, '-' -> 2, ' ' -> 3.
-    # Unknown chars (e.g. '/') are silently dropped (mapped to nothing).
-    sequences       = _tokenizer.texts_to_sequences([morse_input])
-    token_seq       = sequences[0]
-    input_token_len = len(token_seq)
+    char_to_idx  = _vocab["CHAR_TO_IDX"]
+    target_chars = _vocab["TARGET_CHARS"]
+    unk_idx      = char_to_idx.get("<UNK>", 1)
+    pad_idx      = char_to_idx.get("<PAD>", 0)
 
-    log.debug("[AI v2] Step 1 | Input: %r", morse_input)
-    log.debug("[AI v2] Step 1 | Tokens (%d): %s", input_token_len, token_seq)
+    # ── Step 1: Tokenise ──────────────────────────────────────────────────────
+    token_seq = [char_to_idx.get(ch, unk_idx) for ch in morse_input]
+    log.debug("[AI v4] Step 1 | Input: %r", morse_input)
+    log.debug("[AI v4] Step 1 | Tokens (%d): %s", len(token_seq), token_seq[:20])
 
-    if input_token_len == 0:
-        log.warning("[AI v2] Tokenizer produced 0 tokens for input %r", morse_input)
+    if not token_seq:
+        log.warning("[AI v4] Tokeniser produced 0 tokens for input %r", morse_input)
         return ("", 0.0)
 
-    # ── Step 2: Pad to MODEL_SEQ_LEN ─────────────────────────────────────────
-    padded = pad_sequences(
-        [token_seq],
-        maxlen=MODEL_SEQ_LEN,
-        padding="post",
-        truncating="post",
-    )
-    log.debug("[AI v2] Step 2 | Padded shape: %s  first20: %s",
+    # ── Step 2: Pad to MAX_MORSE_LEN ──────────────────────────────────────────
+    seq = token_seq[:MAX_MORSE_LEN]
+    seq += [pad_idx] * (MAX_MORSE_LEN - len(seq))
+    padded = np.array([seq], dtype=np.int32)  # shape (1, MAX_MORSE_LEN)
+    log.debug("[AI v4] Step 2 | Padded shape: %s  first20: %s",
               padded.shape, padded[0][:20].tolist())
 
-    # ── Step 3: Predict -> shape (1, MODEL_SEQ_LEN, 4) ───────────────────────
+    # ── Step 3: Predict -> shape (1, MAX_TEXT_LEN, vocab_size) ───────────────
     raw_preds = _model.predict(padded, verbose=0)
-    pred_0    = raw_preds[0]                        # (108, 4)
+    pred_0    = raw_preds[0]                        # (MAX_TEXT_LEN, vocab_size)
 
-    # ── Step 4: argmax -> token indices ──────────────────────────────────────
-    pred_indices = np.argmax(pred_0, axis=-1)       # (108,)
-    pred_probs   = np.max(pred_0, axis=-1)          # (108,)
+    # ── Step 4: argmax -> target char indices ─────────────────────────────────
+    pred_indices = np.argmax(pred_0, axis=-1)       # (MAX_TEXT_LEN,)
+    pred_probs   = np.max(pred_0, axis=-1)          # (MAX_TEXT_LEN,)
 
-    # ── Step 5 & 6: Reconstruct corrected Morse, trim to input length ─────────
-    active_len     = min(input_token_len, MODEL_SEQ_LEN)
-    active_indices = pred_indices[:active_len]
-    active_probs   = pred_probs[:active_len]
+    # ── Step 5: Map indices to characters, stop at <PAD> ─────────────────────
+    chars = []
+    active_probs = []
+    for idx, prob in zip(pred_indices, pred_probs):
+        ch = target_chars[int(idx)] if int(idx) < len(target_chars) else "?"
+        if ch == "<PAD>":
+            break
+        chars.append(ch)
+        active_probs.append(float(prob))
 
-    # ── Identity-mapping detection ────────────────────────────────────────────
-    # Count how many output tokens equal the corresponding input token.
-    # 100% identity = model learned to copy input (training failure).
-    n_identical    = sum(1 for i in range(active_len)
-                        if int(active_indices[i]) == token_seq[i])
-    identity_ratio = n_identical / active_len if active_len > 0 else 0.0
+    decoded_text = "".join(chars).strip()
+    log.debug("[AI v4] Step 5 | Decoded: %r", decoded_text)
 
-    if identity_ratio >= 1.0:
-        log.warning(
-            "[AI v2] IDENTITY MAPPING: output == input for all %d positions. "
-            "Model learned to copy input (training failure). "
-            "Fuzzy correction active for invalid codes.",
-            active_len,
-        )
-    elif identity_ratio >= 0.8:
-        log.warning(
-            "[AI v2] Near-identity mapping: %.0f%% of positions unchanged.",
-            identity_ratio * 100,
-        )
+    # ── Step 6: Confidence ────────────────────────────────────────────────────
+    confidence = float(np.mean(active_probs)) if active_probs else 0.0
 
     log.debug(
-        "[AI v2] Step 4 | Identity ratio: %.1f%% (%d/%d positions unchanged)",
-        identity_ratio * 100, n_identical, active_len,
-    )
-
-    # Per-position trace (DEBUG level only)
-    for i in range(active_len):
-        in_tok  = token_seq[i]
-        out_tok = int(active_indices[i])
-        in_chr  = IDX_TO_MORSE.get(in_tok, "?")
-        out_chr = IDX_TO_MORSE.get(out_tok, "?")
-        prob    = float(active_probs[i])
-        p4      = [round(float(pred_0[i][j]), 4) for j in range(4)]
-        changed = "" if in_tok == out_tok else "  <-- CHANGED"
-        log.debug(
-            "[AI v2]  pos=%02d  in=%d(%r)  out=%d(%r)  prob=%.4f  p4=%s%s",
-            i, in_tok, in_chr, out_tok, out_chr, prob, p4, changed,
-        )
-
-    # ── Build corrected Morse string ──────────────────────────────────────────
-    corrected_chars = [IDX_TO_MORSE.get(int(i), "") for i in active_indices]
-    corrected_morse = "".join(corrected_chars).strip()
-    log.debug("[AI v2] Step 5 | Corrected Morse: %r", corrected_morse)
-
-    # ── Step 7: Decode corrected Morse -> plain text ──────────────────────────
-    decoded_text = _decode_corrected_morse(corrected_morse)
-
-    # ── Step 8: Confidence ────────────────────────────────────────────────────
-    confidence = float(np.mean(active_probs))
-
-    log.debug(
-        "[AI v2] Result | noisy=%r -> corrected=%r -> text=%r "
-        "| conf=%.3f | identity=%.0f%%",
-        morse_input[:40], corrected_morse[:40], decoded_text[:40],
-        confidence, identity_ratio * 100,
+        "[AI v4] Result | morse=%r -> text=%r | conf=%.3f",
+        morse_input[:40], decoded_text[:40], confidence,
     )
     return (decoded_text, confidence)
 
@@ -511,11 +467,14 @@ def get_model_info() -> dict:
     info = {
         "model_loaded":   _model_loaded,
         "model_path":     str(MODEL_PATH),
-        "tokenizer_type": type(_tokenizer).__name__ if _tokenizer else "None",
-        "model_version":  "v2 (Seq2Seq Denoising BiLSTM)",
-        "seq_len":        MODEL_SEQ_LEN,
-        "output_vocab":   IDX_TO_MORSE,
+        "vocab_path":     str(VOCAB_PATH),
+        "model_version":  "v4 (Direct Morse-to-Text)",
+        "max_morse_len":  MAX_MORSE_LEN,
+        "max_text_len":   MAX_TEXT_LEN,
     }
+    if _vocab is not None:
+        info["char_to_idx"]    = _vocab.get("CHAR_TO_IDX", {})
+        info["target_vocab_size"] = len(_vocab.get("TARGET_CHARS", []))
     if _model is not None:
         if hasattr(_model, "input_shape"):
             info["input_shape"]  = str(_model.input_shape)
