@@ -9,6 +9,7 @@ import threading
 from utils import serial_comm
 from utils.encryption import encrypt_message, decrypt_message
 from utils.history import save_history
+from utils.crc import build_packet, parse_packet
 
 
 C = {
@@ -217,24 +218,42 @@ class LoRaPage(tk.Frame):
             self._set_connected(True)
             self.app_state['com_port'] = port
             def _on_rx(data: str) -> None:
+                # ── CRC verification ──────────────────────────────────────────
+                parsed = parse_packet(data)
+                if not parsed['valid']:
+                    # Corrupted packet – log and reject without decryption
+                    self.after(0, lambda e=parsed['error']: self._term_log(
+                        f'[CRC FAILED] PACKET CORRUPTED – {e}'))
+                    self.after(0, lambda: self._term_log(
+                        '[CRC: FAILED - PACKET CORRUPTED]'))
+                    return
+
+                if parsed['is_legacy']:
+                    self.after(0, lambda: self._term_log('[CRC] Legacy packet (no CRC field).'))
+                else:
+                    self.after(0, lambda c=parsed['crc_rx']: self._term_log(
+                        f'[CRC: VALID] 0x{c:04X}'))
+
+                payload = parsed['payload']
+
                 key = self.app_state.get('enc_key', '')
-                if key and ':' in data:
-                    plaintext, dec_err = decrypt_message(data, key)
+                if key and ':' in payload:
+                    plaintext, dec_err = decrypt_message(payload, key)
                     if dec_err:
-                        self.after(0, lambda d=data: self._term_log(f'[RX CIPHER] {d}'))
+                        self.after(0, lambda d=payload: self._term_log(f'[RX CIPHER] {d}'))
                         self.after(0, lambda e=dec_err: self._term_log(f'[RX DECRYPT ERR] {e}'))
-                        plain_display = data
+                        plain_display = payload
                         enc_status = 'Decrypt Error'
                         save_enc = ''
                     else:
-                        self.after(0, lambda d=data: self._term_log(f'[RX CIPHER] {d}'))
+                        self.after(0, lambda d=payload: self._term_log(f'[RX CIPHER] {d}'))
                         self.after(0, lambda p=plaintext: self._term_log(f'[RX PLAIN ] {p}'))
                         plain_display = plaintext
                         enc_status = 'AES-256 CBC'
-                        save_enc = data
+                        save_enc = payload
                 else:
-                    self.after(0, lambda d=data: self._term_log(f'[RX] {d}'))
-                    plain_display = data
+                    self.after(0, lambda d=payload: self._term_log(f'[RX] {d}'))
+                    plain_display = payload
                     enc_status = 'None'
                     save_enc = ''
 
@@ -281,8 +300,16 @@ class LoRaPage(tk.Frame):
             encrypted = ''
             self._term_log(f'[TX] {msg} (no key – sent unencrypted)')
 
-        ok, result = serial_comm.send_lora(payload, self._conn_log)
+        # ── Wrap in CRC packet ───────────────────────────────────────────────
+        packet = build_packet(payload)
+        from utils.crc import calculate_crc as _crc
+        _crc_val = _crc(payload)
+        self._term_log(f'[CRC GENERATED] 0x{_crc_val:04X} ({_crc_val})')
+        self._term_log(f'[TX PACKET] {packet}')
+
+        ok, result = serial_comm.send_lora(packet, self._conn_log)
         if ok:
+            self._term_log('[PACKET SENT]')
             self.send_var.set('')
             # Save to history
             save_history({
@@ -300,23 +327,37 @@ class LoRaPage(tk.Frame):
     def _receive(self):
         data, err = serial_comm.receive_lora(timeout=3.0)
         if data:
+            # ── CRC verification ─────────────────────────────────────────────
+            parsed = parse_packet(data)
+            if not parsed['valid']:
+                self._term_log(f'[CRC FAILED] PACKET CORRUPTED – {parsed["error"]}')
+                self._term_log('[CRC: FAILED - PACKET CORRUPTED]')
+                return
+
+            if parsed['is_legacy']:
+                self._term_log('[CRC] Legacy packet (no CRC field).')
+            else:
+                self._term_log(f'[CRC: VALID] 0x{parsed["crc_rx"]:04X}')
+
+            payload = parsed['payload']
             key = self.app_state.get('enc_key', '')
+
             # Attempt decryption if we have a key
-            if key and ':' in data:
-                plaintext, dec_err = decrypt_message(data, key)
+            if key and ':' in payload:
+                plaintext, dec_err = decrypt_message(payload, key)
                 if dec_err:
-                    self._term_log(f'[RX CIPHER] {data}')
+                    self._term_log(f'[RX CIPHER] {payload}')
                     self._term_log(f'[RX DECRYPT ERR] {dec_err}')
-                    plain_display = data
+                    plain_display = payload
                     enc_status = 'Decrypt Error'
                 else:
-                    self._term_log(f'[RX CIPHER] {data}')
+                    self._term_log(f'[RX CIPHER] {payload}')
                     self._term_log(f'[RX PLAIN ] {plaintext}')
                     plain_display = plaintext
                     enc_status = 'AES-256 CBC'
             else:
-                self._term_log(f'[RX] {data}')
-                plain_display = data
+                self._term_log(f'[RX] {payload}')
+                plain_display = payload
                 enc_status = 'None'
                 key = ''
 
@@ -325,7 +366,7 @@ class LoRaPage(tk.Frame):
                 'direction':        'RX',
                 'plain_text':       plain_display,
                 'morse_code':       '',
-                'encrypted_data':   data if key else '',
+                'encrypted_data':   payload if key else '',
                 'sender':           self.app_state.get('com_port', 'Remote'),
                 'receiver':         'LOCAL',
                 'encryption_status': enc_status,

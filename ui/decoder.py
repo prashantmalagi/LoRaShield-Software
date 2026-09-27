@@ -470,9 +470,9 @@ class DecoderPage(tk.Frame):
         tk.Label(ci, text='AI CONFIDENCE', bg=C['card2'],
                  fg=C['text3'], font=('Segoe UI', 9, 'bold')).pack(side='left')
 
-        self.conf_var = tk.StringVar(value='0.00%')
+        self.conf_var = tk.StringVar(value='N/A')
         self.conf_label = tk.Label(ci, textvariable=self.conf_var, bg=C['card2'],
-                                   fg=C['text2'], font=('Consolas', 13, 'bold'))
+                                   fg=C['text3'], font=('Consolas', 13, 'bold'))
         self.conf_label.pack(side='left', padx=16)
 
         self.pred_var = tk.StringVar(value='No prediction yet.')
@@ -545,28 +545,33 @@ class DecoderPage(tk.Frame):
         self.txt_output.insert('1.0', text)
         self.txt_output.configure(state='disabled')
 
-        pct = confidence * 100
-        self.conf_var.set(f'{pct:.2f}%')
         elapsed_ms = elapsed * 1000
 
         if is_model_loaded():
+            # AI model was used – show real confidence percentage
+            pct = confidence * 100
             if text == 'Prediction failed':
+                self.conf_var.set('Err')
                 self.conf_label.config(fg=C['error'])
                 self.pred_label.config(fg=C['error'])
                 self.pred_var.set(f'Prediction failed  |  {method}  |  {elapsed_ms:.1f} ms')
                 self.status_var.set('AI inference failed. Check console for details.')
             elif pct < 60.0:
+                self.conf_var.set(f'{pct:.2f}%')
                 self.conf_label.config(fg=C['warning'])
                 self.pred_label.config(fg=C['warning'])
                 self.pred_var.set(f'Low confidence  |  {method}  |  {elapsed_ms:.1f} ms')
                 self.status_var.set(f'Decoded {len(morse)} chars — low confidence ({pct:.1f}%).')
             else:
+                self.conf_var.set(f'{pct:.2f}%')
                 self.conf_label.config(fg=C['success'])
                 self.pred_label.config(fg=C['text3'])
                 self.pred_var.set(f'AI prediction  |  {pct:.1f}% confidence  |  {elapsed_ms:.1f} ms')
                 self.status_var.set(f'Decoded {len(morse)} characters successfully.')
         else:
-            self.conf_label.config(fg=C['text2'])
+            # AI model not loaded – dictionary fallback; confidence is meaningless
+            self.conf_var.set('N/A')
+            self.conf_label.config(fg=C['text3'])
             self.pred_label.config(fg=C['text3'])
             self.pred_var.set(
                 f'Dictionary fallback  |  {elapsed_ms:.1f} ms  '
@@ -586,7 +591,8 @@ class DecoderPage(tk.Frame):
         self.txt_output.configure(state='normal')
         self.txt_output.delete('1.0', 'end')
         self.txt_output.configure(state='disabled')
-        self.conf_var.set('0.00%')
+        self.conf_var.set('N/A')
+        self.conf_label.config(fg=C['text3'])
         self.pred_var.set('No prediction yet.')
         self.status_var.set('Cleared.')
 

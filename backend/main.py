@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 
 from utils import serial_comm
 from utils.encryption import encrypt_message, decrypt_message, generate_key, is_crypto_available
+from utils.crc import build_packet, parse_packet, calculate_crc, verify_crc
 from utils.history import (
     load_history, save_history, delete_history_record,
     clear_history, export_history, search_history, record_count,
@@ -96,20 +97,42 @@ async def _broadcast(payload: dict):
 
 def _serial_rx_callback(data: str):
     """Called on background thread when serial data arrives; schedule WS broadcast."""
+    # ── CRC verification ────────────────────────────────────────────────
+    parsed = parse_packet(data)
+    if not parsed["valid"]:
+        # Corrupted packet – broadcast error, do NOT decrypt
+        crc_payload = {
+            "type": "crc_error",
+            "error": parsed["error"],
+            "crc_rx": parsed["crc_rx"],
+            "crc_calc": parsed["crc_calc"],
+            "message": "CRC: FAILED - PACKET CORRUPTED",
+        }
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(_broadcast(crc_payload), loop)
+        return
+
+    crc_status = "LEGACY (no CRC)" if parsed["is_legacy"] else f"VALID 0x{parsed['crc_rx']:04X}"
+    payload = parsed["payload"]
+
     key = _app_state.get("enc_key", "")
-    if key and ":" in data:
-        plaintext, err = decrypt_message(data, key)
+    if key and ":" in payload:
+        plaintext, err = decrypt_message(payload, key)
         if err:
-            payload = {"type": "rx", "cipher": data, "plain": data, "enc_status": "Decrypt Error"}
+            rx_payload = {"type": "rx", "cipher": payload, "plain": payload,
+                          "enc_status": "Decrypt Error", "crc_status": crc_status}
         else:
-            payload = {"type": "rx", "cipher": data, "plain": plaintext, "enc_status": "AES-256 CBC"}
+            rx_payload = {"type": "rx", "cipher": payload, "plain": plaintext,
+                          "enc_status": "AES-256 CBC", "crc_status": crc_status}
     else:
-        payload = {"type": "rx", "cipher": "", "plain": data, "enc_status": "None"}
+        rx_payload = {"type": "rx", "cipher": "", "plain": payload,
+                      "enc_status": "None", "crc_status": crc_status}
 
     # Schedule the coroutine-based broadcast from a sync thread
     loop = asyncio.get_event_loop()
     if loop.is_running():
-        asyncio.run_coroutine_threadsafe(_broadcast(payload), loop)
+        asyncio.run_coroutine_threadsafe(_broadcast(rx_payload), loop)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -185,7 +208,11 @@ async def send_message(req: SendRequest):
         encrypted = ""
         enc_status = "None"
 
-    ok, result = serial_comm.send_lora(payload)
+    # ── Wrap payload in CRC packet ────────────────────────────────────
+    crc_val = calculate_crc(payload)
+    packet = build_packet(payload)
+
+    ok, result = serial_comm.send_lora(packet)
 
     if ok:
         # Broadcast TX to terminal
@@ -194,6 +221,7 @@ async def send_message(req: SendRequest):
             "plain": msg,
             "cipher": encrypted,
             "enc_status": enc_status,
+            "crc_status": f"GENERATED 0x{crc_val:04X}",
         })
         # Save to history
         save_history({
@@ -206,7 +234,7 @@ async def send_message(req: SendRequest):
             "encryption_status": enc_status,
         })
 
-    return {"ok": ok, "message": result}
+    return {"ok": ok, "message": result, "crc": crc_val}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -417,6 +445,69 @@ def api_generate_key():
 @app.get("/api/encrypt/status")
 def api_crypto_status():
     return {"available": is_crypto_available()}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CRC Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CrcCalculateRequest(BaseModel):
+    data: str
+
+
+class CrcVerifyRequest(BaseModel):
+    data: str
+    received_crc: int
+
+
+class CrcBuildRequest(BaseModel):
+    payload: str
+
+
+class CrcParseRequest(BaseModel):
+    raw: str
+
+
+@app.post("/api/crc/calculate")
+def api_crc_calculate(req: CrcCalculateRequest):
+    """Calculate CRC-16-CCITT for a given data string."""
+    if not req.data and req.data != "":
+        raise HTTPException(400, "data field required")
+    crc = calculate_crc(req.data)
+    return {"data_length": len(req.data), "crc": crc, "crc_hex": f"0x{crc:04X}"}
+
+
+@app.post("/api/crc/verify")
+def api_crc_verify(req: CrcVerifyRequest):
+    """Verify that a data string matches a given CRC value."""
+    ok = verify_crc(req.data, req.received_crc)
+    computed = calculate_crc(req.data)
+    return {
+        "valid": ok,
+        "computed_crc": computed,
+        "computed_crc_hex": f"0x{computed:04X}",
+        "received_crc": req.received_crc,
+        "received_crc_hex": f"0x{req.received_crc:04X}",
+    }
+
+
+@app.post("/api/crc/build-packet")
+def api_crc_build(req: CrcBuildRequest):
+    """Wrap a payload in a JSON CRC packet (same as the TX flow)."""
+    if not req.payload and req.payload != "":
+        raise HTTPException(400, "payload field required")
+    packet = build_packet(req.payload)
+    crc = calculate_crc(req.payload)
+    return {"packet": packet, "crc": crc, "crc_hex": f"0x{crc:04X}"}
+
+
+@app.post("/api/crc/parse-packet")
+def api_crc_parse(req: CrcParseRequest):
+    """Parse and CRC-verify a raw packet string (same as the RX flow)."""
+    if not req.raw:
+        raise HTTPException(400, "raw field required")
+    result = parse_packet(req.raw)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
